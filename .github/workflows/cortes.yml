@@ -1,0 +1,57 @@
+name: medir-cortes
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Identificador del trabajo (letras, numeros, - y _)"
+        required: true
+      video_url:
+        description: "URL https del MP4 (cdninstagram.com o fbcdn.net)"
+        required: true
+      callback_url:
+        description: "URL a la que se entrega el resultado (la pone n8n; vacia en pruebas manuales)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cortes-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  cortes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ocultar las URL en los registros
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+        run: |
+          echo "::add-mask::$VIDEO_URL"
+          if [ -n "$CALLBACK_URL" ]; then echo "::add-mask::$CALLBACK_URL"; fi
+
+      - name: Instalar ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Medir cortes
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          VIDEO_URL: ${{ inputs.video_url }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          CALLBACK_TOKEN: ${{ secrets.CALLBACK_TOKEN }}
+        run: python3 medir_cortes.py --job-id "$JOB_ID" --out resultado.json
+
+      - name: Guardar resultado un dia
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resultado-${{ inputs.job_id }}
+          path: resultado.json
+          retention-days: 1
+          if-no-files-found: ignore
