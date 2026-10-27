@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Mide cortes de escena de un video con ffmpeg y devuelve JSON. Solo biblioteca estándar.
 
-Uso en GitHub Actions: lee VIDEO_URL, JOB_ID, CALLBACK_URL y CALLBACK_TOKEN del entorno.
+Uso en GitHub Actions (repositorio publico): el workflow solo recibe JOB_ID. El video y la direccion
+de entrega los pide este script a n8n (N8N_JOB_URL, con la clave CALLBACK_TOKEN); ambas son secretos del
+repositorio. Las dos URL que n8n devuelve se enmascaran en los registros antes de usarse.
 Uso local de prueba:   python3 medir_cortes.py --file video.mp4 --job-id prueba --out salida.json
-No imprime nunca la URL del video ni las claves.
+No imprime nunca la URL del video, la de entrega ni las claves.
 """
 import argparse, hashlib, json, os, re, subprocess, sys, tempfile, time
 import urllib.error, urllib.parse, urllib.request
@@ -110,8 +112,38 @@ def cortes(path, fps):
     return out
 
 
-def enviar(resultado):
-    url, token = os.environ.get("CALLBACK_URL"), os.environ.get("CALLBACK_TOKEN")
+def traer_trabajo(job_id):
+    """Pide a n8n el video y la direccion de entrega de este trabajo. Devuelve (video_url, callback_url)."""
+    base, token = os.environ.get("N8N_JOB_URL", ""), os.environ.get("CALLBACK_TOKEN", "")
+    if not base or not token:
+        falla("faltan N8N_JOB_URL o CALLBACK_TOKEN en el entorno", 2)
+    bu = urllib.parse.urlparse(base)
+    if bu.scheme != "https" or bu.username or bu.password:
+        falla("N8N_JOB_URL debe ser https sin usuario", 2)
+    url = base + ("&" if bu.query else "?") + urllib.parse.urlencode({"job_id": job_id})
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            d = json.loads(r.read(1 << 16))
+    except urllib.error.HTTPError as e:
+        falla(f"n8n rechazo el pedido del trabajo: HTTP {e.code}", 3)
+    except Exception as e:
+        falla(f"no se pudo pedir el trabajo a n8n: {type(e).__name__}", 3)
+    video, cb = d.get("video_url"), d.get("callback_url")
+    for u in (video, cb):                       # enmascarar ANTES de cualquier otro uso
+        if isinstance(u, str) and u:
+            print(f"::add-mask::{u}")
+    if not isinstance(video, str) or not host_ok(video):
+        falla("n8n devolvio un video que no es de cdninstagram.com o fbcdn.net", 3)
+    cu = urllib.parse.urlparse(cb) if isinstance(cb, str) else None
+    if not cu or cu.scheme != "https" or (cu.hostname or "").lower() != (bu.hostname or "").lower():
+        falla("la direccion de entrega no es https del mismo servidor de n8n", 3)
+    return video, cb
+
+
+def enviar(resultado, url=None):
+    url = url or os.environ.get("CALLBACK_URL")
+    token = os.environ.get("CALLBACK_TOKEN")
     if not url:
         return False
     cuerpo = json.dumps(resultado).encode()
@@ -140,15 +172,18 @@ def main():
     a = ap.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", a.job_id or ""):
         falla("job_id invalido (solo letras, numeros, - y _, maximo 64)")
+    video_url = os.environ.get("VIDEO_URL", "")
+    callback_url = os.environ.get("CALLBACK_URL")
+    if not a.file and not video_url:
+        video_url, callback_url = traer_trabajo(a.job_id)
     with tempfile.TemporaryDirectory() as tmp:
         if a.file:
             path = a.file
             tam = os.path.getsize(path)
             sha = hashlib.sha256(open(path, "rb").read()).hexdigest()
         else:
-            url = os.environ.get("VIDEO_URL", "")
             path = os.path.join(tmp, "video.mp4")
-            tam, sha = descargar(url, path)
+            tam, sha = descargar(video_url, path)
         meta = ffprobe(path)
         lista = cortes(path, meta["fps"])
         ver = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True).stdout.splitlines()[0]
@@ -161,8 +196,8 @@ def main():
     }
     json.dump(resultado, open(a.out, "w"), ensure_ascii=False, indent=2)
     print(f"cortes: {resultado['resumen']}  duracion: {meta['duracion_s']} s")
-    if not a.file and not enviar(resultado):
-        if os.environ.get("CALLBACK_URL"):
+    if not a.file and not enviar(resultado, callback_url):
+        if callback_url:
             falla("no se pudo entregar el resultado", 6)
 
 
